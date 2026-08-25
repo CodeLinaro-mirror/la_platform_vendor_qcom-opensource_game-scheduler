@@ -6075,7 +6075,7 @@ dependencies = [
 
 [[package]]
 name = "scx_mlfq"
-version = "1.0.1"
+version = "1.3.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -6089,7 +6089,9 @@ dependencies = [
  "scx_stats_derive",
  "scx_utils",
  "serde",
+ "serde_json",
  "simplelog",
+ "tiny_http",
 ]
 
 [[package]]
