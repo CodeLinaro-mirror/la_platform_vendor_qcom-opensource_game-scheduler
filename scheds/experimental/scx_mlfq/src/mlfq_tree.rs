@@ -37,9 +37,9 @@ const MLFQ_TREE_MAX_NODES: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MAX_NO
 /// Walk depth bound of the shared store entry, from `src/bpf/intf.h`.
 const MLFQ_TREE_MAX_DEPTH: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MAX_DEPTH as usize;
 
-/// Number of populated features; ids 0..7 index the walk's `feat[8]` slots,
-/// sleep_var_ratio at id 8 is carry-along for the next ABI.
-const MLFQ_TREE_NR_FEATURES: usize = 8;
+/// Number of populated features; ids 0..8 index the walk's `feat[9]` slots,
+/// sleep_var_ratio at id 9 is carry-along for the next ABI, gpu_submit at 8 quantised 0..4.
+const MLFQ_TREE_NR_FEATURES: usize = 9;
 
 /// Default minimum relative variance reduction for a split.
 ///
@@ -52,13 +52,58 @@ const MLFQ_TREE_NR_FEATURES: usize = 8;
 /// scales with the label magnitude and needs no unit-dependent tuning.
 pub const DEFAULT_MIN_REL_VAR_REDUCTION: f64 = 1e-3;
 
+/// Scratch buffers for the CART fit, sized to the maximum window and node
+/// budget. The buffers are allocated once with the capacities below and
+/// reused across fits by clearing in place, so the training path does not
+/// allocate after the first fit. The queue holds owned sample vectors per
+/// node; those vectors are still allocated per node, but the major buffers
+/// (weights, sorted, left/right) are reused. This keeps the 60s training
+/// free of steady-state allocations while preserving the exact CART logic.
+pub struct FitScratch {
+    pub weights: Vec<f64>,
+    pub sorted: Vec<WeightedSample>,
+    pub left: Vec<WeightedSample>,
+    pub right: Vec<WeightedSample>,
+    pub nodes: Vec<TreeNode>,
+    #[allow(private_interfaces)]
+    pub queue: VecDeque<NodeSpec>,
+    pub preds: Vec<u64>,
+    pub actuals: Vec<u64>,
+    pub ema_preds: Vec<u64>,
+    pub weights_full: Vec<f64>,
+}
+
+impl FitScratch {
+    /// Create a scratch arena with capacities for the maximum window.
+    pub fn new() -> Self {
+        Self {
+            weights: Vec::with_capacity(16384),
+            sorted: Vec::with_capacity(16384),
+            left: Vec::with_capacity(16384),
+            right: Vec::with_capacity(16384),
+            nodes: Vec::with_capacity(2048),
+            queue: VecDeque::with_capacity(2048),
+            preds: Vec::with_capacity(2048),
+            actuals: Vec::with_capacity(2048),
+            ema_preds: Vec::with_capacity(2048),
+            weights_full: Vec::with_capacity(16384),
+        }
+    }
+}
+
+impl Default for FitScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-task feature vector, the mirror of `struct mlfq_tree_feats`.
 ///
 /// Field order is part of the shared ABI with the BPF sample struct and
 /// the emitted `mlfq_tree_sample` layout. `prev_burst_ns`, `sleep_ns`,
 /// `ema`, `io_wait`, `wake_cnt`, then the measured service fields
-/// (`wake_lat_us`, `queue_wait_us`, `sq_ema`) and the cadence feature
-/// (`sleep_var_ratio`).
+/// (`wake_lat_us`, `queue_wait_us`, `sq_ema`), the cadence feature
+/// (`sleep_var_ratio`) and the gpu feature (`gpu_submit` quant 0..4).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct TreeFeats {
@@ -80,8 +125,12 @@ pub struct TreeFeats {
     pub sq_ema: u64,
     /// Sleep variation ratio, FP_SHIFT fixed point (8).
     pub sleep_var_ratio: u32,
-    /// Pad to 56 bytes, keeps 8-byte tail alignment.
+    /// Pad to 64-byte alignment.
     pub pad: u32,
+    /// GPU submissions quantised 0..4.
+    pub gpu_submit: u32,
+    /// Pad to 64 bytes, keeps 8-byte tail alignment.
+    pub pad2: u32,
 }
 
 /// One training sample, the mirror of `struct mlfq_tree_sample`.
@@ -91,7 +140,7 @@ pub struct TreeFeats {
 /// `MLFQ_TREE_SAMPLE_VERSION` and is checked by the daemon's parse, so
 /// a record from an out-of-tree producer fails the check instead of
 /// being misread. The BPF struct is `packed, aligned(4)` to keep the
-/// record at 76 bytes, so this mirror is packed identically; every
+/// record at 84 bytes, so this mirror is packed identically; every
 /// field sits at its naturally aligned offset, and the daemon reads the
 /// record with `read_unaligned`.
 #[derive(Clone, Copy, Debug)]
@@ -142,11 +191,11 @@ pub struct SerializedTree {
     pub nodes: Vec<TreeNode>,
 }
 
-/// Feature value for a feature id, matching the BPF walk's `feat[8]` slot
-/// layout in `src/bpf/intf.h` (`mlfq_tree_walk`). Ids 0..7 are the split
+/// Feature value for a feature id, matching the BPF walk's `feat[9]` slot
+/// layout in `src/bpf/intf.h` (`mlfq_tree_walk`). Ids 0..8 are the split
 /// features (prev_burst, sleep, ema, io_wait, wake_cnt, wake_lat,
-/// queue_wait, sq_ema), id 8 the cadence ratio (carry-along, split
-/// when NR_FEATURES promotes it), and the rest zero.
+/// queue_wait, sq_ema, gpu_submit), id 9 the cadence ratio (carry-along,
+/// split when NR_FEATURES promotes it), and the rest zero.
 fn feat_value(f: TreeFeats, id: u8) -> u64 {
     match id {
         0 => f.prev_burst_ns,
@@ -157,7 +206,8 @@ fn feat_value(f: TreeFeats, id: u8) -> u64 {
         5 => f.wake_lat_us as u64,
         6 => f.queue_wait_us as u64,
         7 => f.sq_ema,
-        8 => f.sleep_var_ratio as u64,
+        8 => f.gpu_submit as u64,
+        9 => f.sleep_var_ratio as u64,
         _ => 0,
     }
 }
@@ -177,6 +227,15 @@ fn midpoint(v: u64, w: u64) -> u64 {
 /// carries through the node partitions.
 type WeightedSample = (TreeSample, f64);
 
+/// One node in the BFS queue during fit. The samples are the weighted
+/// samples that reached this node. This is an internal detail of the
+/// fit and is not part of the published tree.
+pub(crate) struct NodeSpec {
+    idx: usize,
+    samples: Vec<WeightedSample>,
+    depth: usize,
+}
+
 /// Recency weight of each training sample, by its age in the window.
 ///
 /// age_i = n - i (i = 0 is the oldest sample, n the window length) and
@@ -185,11 +244,26 @@ type WeightedSample = (TreeSample, f64);
 /// fit concentrates on the recent regime without dropping the older
 /// data entirely and no weight can underflow. Each weight is one
 /// `powf`, so there is no error accumulation across samples.
+#[allow(dead_code)]
 pub fn sample_weights(n: usize) -> Vec<f64> {
     let half_life = n as f64 / 2.0;
     (0..n)
         .map(|i| 2.0f64.powf(-((n - i) as f64) / half_life))
         .collect()
+}
+
+/// Fill the provided buffer with recency weights without allocating.
+/// The buffer is cleared and filled to length n; capacity is retained
+/// so the second call with the same n does not allocate.
+pub fn sample_weights_into(n: usize, out: &mut Vec<f64>) {
+    out.clear();
+    if out.capacity() < n {
+        out.reserve(n - out.len());
+    }
+    let half_life = n as f64 / 2.0;
+    for i in 0..n {
+        out.push(2.0f64.powf(-((n - i) as f64) / half_life));
+    }
 }
 
 /// Sum of weights, weighted sum and weighted sum-of-squares of a node's
@@ -207,6 +281,7 @@ fn label_totals(samples: &[WeightedSample]) -> (f64, f64, f64) {
 /// Partition a node's samples by a split, mirroring the walk's `<=`
 /// routing. `feat_value <= threshold` goes left. The recency weights
 /// ride along with their samples.
+#[allow(dead_code)]
 fn partition(
     samples: &[WeightedSample],
     feature: u8,
@@ -246,6 +321,7 @@ fn leaf_prediction(mean_ns: u64) -> u32 {
 /// reduction.
 ///
 /// Returns `(feature, threshold)`.
+#[allow(dead_code)]
 fn best_split(
     samples: &[WeightedSample],
     min_samples_leaf: usize,
@@ -260,6 +336,73 @@ fn best_split(
     for feature in 0..MLFQ_TREE_NR_FEATURES {
         let mut sorted: Vec<WeightedSample> = samples.to_vec();
         sorted.sort_by_key(|(s, _)| feat_value(s.feats, feature as u8));
+
+        let mut sw_l = 0.0f64;
+        let mut swy_l = 0.0f64;
+        let mut swy2_l = 0.0f64;
+        let mut i = 0usize;
+        while i < n {
+            let v = feat_value(sorted[i].0.feats, feature as u8);
+            let mut j = i;
+            while j < n && feat_value(sorted[j].0.feats, feature as u8) == v {
+                let (s, w) = sorted[j];
+                let y = s.label_ns as f64;
+                sw_l += w;
+                swy_l += w * y;
+                swy2_l += w * y * y;
+                j += 1;
+            }
+
+            /* Left group = all values <= v. A split needs a higher value. */
+            let n_l = j;
+            let n_r = n - j;
+            if n_l >= min_samples_leaf && n_r >= min_samples_leaf && j < n {
+                let v_next = feat_value(sorted[j].0.feats, feature as u8);
+                let threshold = midpoint(v, v_next);
+                let sse_l = swy2_l - swy_l * swy_l / sw_l;
+                let sw_r = total_w - sw_l;
+                let swy_r = total_wy - swy_l;
+                let swy2_r = total_wy2 - swy2_l;
+                let sse_r = swy2_r - swy_r * swy_r / sw_r;
+                let reduction = sse - sse_l - sse_r;
+
+                if reduction > min_reduction {
+                    let replace = match best {
+                        Some((_, _, r)) => reduction > r,
+                        None => true,
+                    };
+                    if replace {
+                        best = Some((feature as u8, threshold, reduction));
+                    }
+                }
+            }
+            i = j;
+        }
+    }
+
+    best.map(|(f, t, _)| (f, t))
+}
+
+/// Variant of best_split that reuses a caller-provided buffer for sorting.
+/// The buffer is cleared and filled from samples for each feature, so the
+/// per-feature allocation is avoided after the first call.
+fn best_split_with_scratch(
+    samples: &[WeightedSample],
+    min_samples_leaf: usize,
+    sse: f64,
+    min_rel_var_reduction: f64,
+    scratch: &mut Vec<WeightedSample>,
+) -> Option<(u8, u64)> {
+    let n = samples.len();
+    let (total_w, total_wy, total_wy2) = label_totals(samples);
+    let min_reduction = sse * min_rel_var_reduction;
+    let mut best: Option<(u8, u64, f64)> = None;
+
+    for feature in 0..MLFQ_TREE_NR_FEATURES {
+        scratch.clear();
+        scratch.extend_from_slice(samples);
+        scratch.sort_by_key(|(s, _)| feat_value(s.feats, feature as u8));
+        let sorted = &*scratch;
 
         let mut sw_l = 0.0f64;
         let mut swy_l = 0.0f64;
@@ -343,6 +486,7 @@ fn best_split(
 /// An empty `samples` slice or `max_nodes == 0` yields an empty tree,
 /// which `serialize_validate()` rejects; the daemon treats an empty tree
 /// as untrained.
+#[allow(dead_code)]
 pub fn fit(
     samples: &[TreeSample],
     max_depth: usize,
@@ -350,24 +494,52 @@ pub fn fit(
     max_nodes: usize,
     min_rel_var_reduction: f64,
 ) -> SerializedTree {
+    let mut scratch = FitScratch::new();
+    fit_with_scratch(
+        samples,
+        max_depth,
+        min_samples_leaf,
+        max_nodes,
+        min_rel_var_reduction,
+        &mut scratch,
+    )
+}
+
+/// Fit a tree reusing the caller-provided scratch arena. After the first
+/// call the arena retains its capacity, so subsequent fits do not allocate.
+/// The logic is identical to `fit()`, only the temporary buffers are reused.
+pub fn fit_with_scratch(
+    samples: &[TreeSample],
+    max_depth: usize,
+    min_samples_leaf: usize,
+    max_nodes: usize,
+    min_rel_var_reduction: f64,
+    scratch: &mut FitScratch,
+) -> SerializedTree {
     if samples.is_empty() || max_nodes == 0 {
         return SerializedTree::default();
     }
 
-    let weights = sample_weights(samples.len());
-
-    struct NodeSpec {
-        idx: usize,
-        samples: Vec<WeightedSample>,
-        depth: usize,
-    }
-
-    let mut nodes: Vec<TreeNode> = Vec::new();
-    let mut queue = VecDeque::new();
+    sample_weights_into(samples.len(), &mut scratch.weights);
+    let weights = &scratch.weights;
+    scratch.nodes.clear();
+    scratch.nodes.reserve(max_nodes);
+    scratch.queue.clear();
+    // Node storage is in the scratch arena. Clear but keep capacity.
+    let nodes = &mut scratch.nodes;
+    let queue = &mut scratch.queue;
     nodes.push(TreeNode::default()); /* root placeholder */
+    // Build the weighted samples for the root. Reuse the left buffer as
+    // temporary weighted storage, then move it into the root.
+    scratch.left.clear();
+    for (s, w) in samples.iter().copied().zip(weights.iter().copied()) {
+        scratch.left.push((s, w));
+    }
+    let mut root_samples = Vec::new();
+    std::mem::swap(&mut root_samples, &mut scratch.left);
     queue.push_back(NodeSpec {
         idx: 0,
-        samples: samples.iter().copied().zip(weights).collect(),
+        samples: root_samples,
         depth: 0,
     });
 
@@ -390,7 +562,14 @@ pub fn fit(
              */
             && sse > 1e-12 * swy2;
         let best = if splittable {
-            best_split(&spec.samples, min_samples_leaf, sse, min_rel_var_reduction)
+            // Reuse the sorted buffer from the scratch arena.
+            best_split_with_scratch(
+                &spec.samples,
+                min_samples_leaf,
+                sse,
+                min_rel_var_reduction,
+                &mut scratch.sorted,
+            )
         } else {
             None
         };
@@ -409,7 +588,23 @@ pub fn fit(
                 /* Child placeholders, filled when dequeued. */
                 nodes.push(TreeNode::default());
                 nodes.push(TreeNode::default());
-                let (left, right) = partition(&spec.samples, feature, threshold);
+                // Reuse the left/right buffers from the scratch arena.
+                // partition_into clears and fills them, then we move the
+                // filled vectors into the queue. The scratch buffers are
+                // left empty but retain capacity for the next split.
+                scratch.left.clear();
+                scratch.right.clear();
+                for s in &spec.samples {
+                    if feat_value(s.0.feats, feature) <= threshold {
+                        scratch.left.push(*s);
+                    } else {
+                        scratch.right.push(*s);
+                    }
+                }
+                let mut left = Vec::new();
+                let mut right = Vec::new();
+                std::mem::swap(&mut left, &mut scratch.left);
+                std::mem::swap(&mut right, &mut scratch.right);
                 queue.push_back(NodeSpec {
                     idx: left_idx as usize,
                     samples: left,
@@ -433,7 +628,9 @@ pub fn fit(
         }
     }
 
-    SerializedTree { nodes }
+    let mut out_nodes = Vec::new();
+    std::mem::swap(&mut out_nodes, nodes);
+    SerializedTree { nodes: out_nodes }
 }
 
 /// Validate a tree against the walk's invariants before publishing.
@@ -441,7 +638,7 @@ pub fn fit(
 /// Every node count must sit in `[1, MLFQ_TREE_MAX_NODES]`. Every node
 /// must be reachable from the root. Every leaf (`right == 0`) is
 /// unconstrained beyond that. Every internal node must split on a feature
-/// id below the five populated slots, both children must be in-bounds,
+/// id below the nine populated slots, both children must be in-bounds,
 /// and both must follow the parent in the BFS order (parents before
 /// children), which the store layout relies on.
 ///
@@ -529,7 +726,7 @@ pub fn serialize_validate(tree: &SerializedTree) -> Result<(), String> {
 ///
 /// The walk descends at most `MLFQ_TREE_MAX_DEPTH` internal nodes, masking
 /// every index with `MLFQ_TREE_MAX_NODES - 1`, splitting on
-/// `feature & 0x7`, and returning `left` for a leaf (`right == 0`). A
+/// `feature & 0xF`, and returning `left` for a leaf (`right == 0`). A
 /// masked index past the live nodes of an unpadded tree reads like a
 /// zeroed store node (a leaf predicting 0). Depth exhausted, the last
 /// reachable node's `left` is returned only when that node is a leaf; an
@@ -551,8 +748,8 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
         feats.wake_lat_us as u64,
         feats.queue_wait_us as u64,
         feats.sq_ema,
+        feats.gpu_submit as u64,
         feats.sleep_var_ratio as u64,
-        0,
         0,
         0,
         0,
@@ -571,7 +768,7 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
         if node.right == 0 {
             return node.left as u64;
         }
-        let feature = (node.feature & 0x7) as usize;
+        let feature = (node.feature & 0xF) as usize;
         let next = if feat[feature] <= node.threshold {
             node.left as usize
         } else {
@@ -608,12 +805,7 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
 /// This is the daemon's contract with the README's claim that the tree
 /// is published when it beats the baseline: a regressed model is kept
 /// out and the previous model stays committed.
-pub fn should_publish(
-    mae_tree: f64,
-    mae_ema: f64,
-    corr: f64,
-    published_corr: Option<f64>,
-) -> bool {
+pub fn should_publish(mae_tree: f64, mae_ema: f64, corr: f64, published_corr: Option<f64>) -> bool {
     if mae_tree > mae_ema {
         return false;
     }
@@ -792,8 +984,8 @@ mod tests {
             feats.wake_lat_us as u64,
             feats.queue_wait_us as u64,
             feats.sq_ema,
+            feats.gpu_submit as u64,
             feats.sleep_var_ratio as u64,
-            0,
             0,
             0,
             0,
@@ -811,7 +1003,7 @@ mod tests {
             if node.right == 0 {
                 return idx;
             }
-            let feature = (node.feature & 0x7) as usize;
+            let feature = (node.feature & 0xF) as usize;
             let next = if feat[feature] <= node.threshold {
                 node.left as usize
             } else {
@@ -1115,9 +1307,9 @@ mod tests {
         let fit_ok = |min_rel: f64| fit(&samples, 4, 1, 31, min_rel);
         assert!(serialize_validate(&fit_ok(0.0)).is_ok());
 
-        // Internal node splitting on feature 8 (beyond NR_FEATURES 8).
+        // Internal node splitting on feature 9 (beyond NR_FEATURES 9).
         let mut bad = fit_ok(0.0);
-        bad.nodes[0].feature = 8;
+        bad.nodes[0].feature = 9;
         assert!(serialize_validate(&bad).is_err());
 
         // Child index out of range.
@@ -1489,8 +1681,8 @@ mod tests {
         assert_eq!(size_of::<TreeFeats>(), size_of::<mlfq_tree_feats>());
         assert_eq!(size_of::<TreeNode>(), size_of::<mlfq_tree_node>());
         assert_eq!(size_of::<TreeSample>(), size_of::<mlfq_tree_sample>());
-        assert_eq!(size_of::<TreeFeats>(), 56);
-        assert_eq!(size_of::<TreeSample>(), 76);
+        assert_eq!(size_of::<TreeFeats>(), 64);
+        assert_eq!(size_of::<TreeSample>(), 84);
         assert_eq!(size_of::<TreeNode>(), 24);
 
         assert_eq!(
@@ -1526,11 +1718,17 @@ mod tests {
             offset_of!(TreeFeats, sleep_var_ratio),
             offset_of!(mlfq_tree_feats, sleep_var_ratio)
         );
+        assert_eq!(
+            offset_of!(TreeFeats, gpu_submit),
+            offset_of!(mlfq_tree_feats, gpu_submit)
+        );
         assert_eq!(offset_of!(TreeFeats, wake_lat_us), 32);
         assert_eq!(offset_of!(TreeFeats, queue_wait_us), 36);
         assert_eq!(offset_of!(TreeFeats, sq_ema), 40);
         assert_eq!(offset_of!(TreeFeats, sleep_var_ratio), 48);
         assert_eq!(offset_of!(TreeFeats, pad), 52);
+        assert_eq!(offset_of!(TreeFeats, gpu_submit), 56);
+        assert_eq!(offset_of!(TreeFeats, pad2), 60);
 
         assert_eq!(
             offset_of!(TreeNode, threshold),
@@ -1571,8 +1769,8 @@ mod tests {
         );
         assert_eq!(offset_of!(TreeSample, queue), 4);
         assert_eq!(offset_of!(TreeSample, feats), 8);
-        assert_eq!(offset_of!(TreeSample, label_ns), 64);
-        assert_eq!(offset_of!(TreeSample, version), 72);
+        assert_eq!(offset_of!(TreeSample, label_ns), 72);
+        assert_eq!(offset_of!(TreeSample, version), 80);
     }
 
     #[test]
