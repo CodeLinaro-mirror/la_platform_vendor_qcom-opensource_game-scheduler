@@ -69,8 +69,9 @@ UEI_DEFINE(uei);
 #define SHARED_DSQ	0
 
 /*
- * Pages handed to the arena's static allocator, which the task context
- * allocator carves its bookkeeping out of. Same granularity ArenaLib uses.
+ * Slack pages added to the arena's static pool on top of what the cid keyed
+ * arrays need, for the task context allocator's own bookkeeping. Same
+ * granularity ArenaLib uses.
  */
 #define STATIC_ALLOC_PAGES	8
 
@@ -79,6 +80,17 @@ UEI_DEFINE(uei);
  * wakeup-intensive tasks.
  */
 #define MAX_WAKEUP_FREQ	1024
+
+/*
+ * The verifier only associates a program with an arena if the program emits an
+ * LD_IMM64 loading the map. Reaching the arena through a pointer kept in a
+ * global doesn't do that, so a program that has no other reason to load the
+ * map has to say so explicitly, or its first addr_space_cast is rejected.
+ *
+ * The cid bitmap helpers do this internally. Keep a local form for programs
+ * which access other arena globals without going through those helpers.
+ */
+#define TOUCH_ARENA()	do { asm volatile("" :: "r"(&arena)); } while (0)
 
 /* Time slice assigned to each task. */
 const volatile u64 slice_ns;
@@ -93,7 +105,12 @@ const volatile u64 slice_ns;
  * the domain covers everything.
  */
 const volatile bool primary_all = true;
-const volatile u64 primary_cpus[MAX_CID_WORDS];
+
+/*
+ * Primary domain in cpu space, filled by cidland_set_primary_word() before
+ * attach and consumed once by ops.init().
+ */
+static u64 __arena *primary_cpus;
 
 /*
  * Maximum time slice credit a task can accumulate while sleeping, before being
@@ -112,6 +129,14 @@ volatile u64 nr_local_llc, nr_remote_llc;
  * [0, nr_cids).
  */
 static u32 nr_cids;
+
+/*
+ * Width of the cid space that the arena arrays below were sized for, and the
+ * number of u64 words needed to hold one bit per cid. Both are established by
+ * cidland_arena_init() from the CPU count userspace hands it.
+ */
+static u32 nr_cids_max;
+static u32 nr_cid_words;
 
 /*
  * Number of possible CPU ids, initialized in ops.init(). Used to detect the
@@ -133,8 +158,14 @@ struct task_ctx {
 	u64 last_woke_at;		/* when the task last woke up */
 	u64 burst_runtime;		/* runtime accumulated since the last sleep */
 	u64 wakeup_freq;		/* average wakeup frequency */
-	u64 allowed[MAX_CID_WORDS];	/* cids the task is allowed to run on */
+	u64 allowed[];			/* cids the task is allowed to run on */
 };
+
+/* Size of a task context holding @nr_cid_words words of allowed cids. */
+static u64 task_ctx_size(u32 nr_words)
+{
+	return sizeof(struct task_ctx) + (u64)nr_words * sizeof(u64);
+}
 
 /*
  * Task contexts are allocated from the arena so that @allowed is an arena
@@ -169,19 +200,19 @@ struct cid_ctx {
  * helper that returns NULL and makes every caller handle a case that can't
  * happen.
  */
-__arena_global struct cid_ctx cid_ctxs[MAX_CIDS];
+static struct cid_ctx __arena *cid_ctxs;
 
 /*
  * Mask with every cid set, handed to the pick loop for the tasks that can run
  * anywhere: it keeps the loop testing a real mask instead of special casing a
  * NULL one, which the verifier can't follow through the inlined tests.
  */
-__arena_global u64 all_cids[MAX_CID_WORDS] = { [0 ... MAX_CID_WORDS - 1] = ~0ULL };
+static u64 __arena *all_cids;
 
 /*
  * Primary domain in cid space, built in ops.init() from @primary_cpus.
  */
-__arena_global u64 primary_cids[MAX_CID_WORDS];
+static u64 __arena *primary_cids;
 
 /*
  * Bitmap of the cids that are currently idle, maintained by ops.update_idle().
@@ -189,7 +220,7 @@ __arena_global u64 primary_cids[MAX_CID_WORDS];
  * Since cids are topologically ordered, each word covers 64 CPUs that are
  * close to each other in the system topology.
  */
-__arena_global u64 idle_cids[MAX_CID_WORDS];
+static u64 __arena *idle_cids;
 
 /*
  * Return true if @cid is a cid this scheduler can address.
@@ -200,6 +231,18 @@ __arena_global u64 idle_cids[MAX_CID_WORDS];
 static bool cid_valid(s32 cid)
 {
 	return cid >= 0 && (u32)cid < nr_cids;
+}
+
+/*
+ * Return the topology of @cid.
+ *
+ * @cid must be valid, see cid_valid().
+ */
+static struct cid_ctx __arena *cid_ctx(s32 cid)
+{
+	TOUCH_ARENA();
+
+	return &cid_ctxs[cid];
 }
 
 static bool cid_test_idle(s32 cid)
@@ -253,9 +296,10 @@ static bool cid_range_is_idle(u32 base, u32 nr)
  */
 static void seed_task_cmask(struct task_struct *p, struct task_ctx __arena *tctx)
 {
-	u32 cpu;
+	u32 cpu, i;
 
-	__builtin_memset(tctx->allowed, 0, sizeof(tctx->allowed));
+	bpf_for(i, 0, nr_cid_words)
+		tctx->allowed[i] = 0;
 
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		s32 cid;
@@ -301,7 +345,7 @@ static s32 claim_idle_cid_range(u64 __arena *allowed, u64 __arena *domain,
 		if (!cid_test_idle(cid))
 			continue;
 		if (whole_core) {
-			const struct cid_ctx __arena *cctx = &cid_ctxs[cid];
+			const struct cid_ctx __arena *cctx = cid_ctx(cid);
 
 			if (!cid_range_is_idle(cctx->core_base, cctx->core_nr))
 				continue;
@@ -665,7 +709,8 @@ void BPF_STRUCT_OPS(cidland_set_cmask, struct task_struct *p,
 
 	tctx = lookup_task_ctx(p);
 
-	__builtin_memset(tctx->allowed, 0, sizeof(tctx->allowed));
+	bpf_for(i, 0, nr_cid_words)
+		tctx->allowed[i] = 0;
 
 	wbase = cmask->base / 64;
 	nr_words = CMASK_NR_WORDS(cmask->nr_cids);
@@ -673,7 +718,7 @@ void BPF_STRUCT_OPS(cidland_set_cmask, struct task_struct *p,
 	bpf_for(i, 0, nr_words) {
 		u32 idx = wbase + i;
 
-		if (idx >= MAX_CID_WORDS)
+		if (idx >= nr_cid_words)
 			break;
 
 		tctx->allowed[idx] = cmask->bits[i];
@@ -751,7 +796,7 @@ static s32 init_cid_ctxs(void)
 	bpf_for(i, 0, nr_cids) {
 		struct scx_cid_topo *topo = &init_topo;
 		s32 cid = nr_cids - 1 - i;
-		struct cid_ctx __arena *cctx = &cid_ctxs[cid];
+		struct cid_ctx __arena *cctx = cid_ctx(cid);
 
 		scx_bpf_cid_topo(cid, topo);
 
@@ -801,9 +846,7 @@ static void init_primary_cids(void)
 		u32 idx = cpu / 64;
 		s32 cid;
 
-		/* @primary_cpus is a read-only global, still verifier tracked. */
-		barrier_var(idx);
-		if (idx >= MAX_CID_WORDS)
+		if (idx >= nr_cid_words)
 			break;
 		if (!(primary_cpus[idx] & (1ULL << (cpu & 63))))
 			continue;
@@ -820,15 +863,22 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cidland_init)
 {
 	s32 err;
 
-	nr_cpu_ids = scx_bpf_nr_cpu_ids();
-	if (nr_cpu_ids > MAX_CIDS) {
-		scx_bpf_error("too many cpu ids: %u (max %u)", nr_cpu_ids, MAX_CIDS);
-		return -E2BIG;
+	if (!nr_cids_max) {
+		scx_bpf_error("cidland_arena_init() didn't run");
+		return -EINVAL;
 	}
 
+	nr_cpu_ids = scx_bpf_nr_cpu_ids();
 	nr_cids = scx_bpf_nr_cids();
-	if (nr_cids > MAX_CIDS) {
-		scx_bpf_error("cid space too large: %u (max %u)", nr_cids, MAX_CIDS);
+
+	/*
+	 * Everything indexed by cid was sized from the CPU count userspace
+	 * saw. The cid space is num_possible_cpus() wide, so this should
+	 * always hold; bail out rather than run off the end if it doesn't.
+	 */
+	if (nr_cids > nr_cids_max || nr_cpu_ids > nr_cids_max) {
+		scx_bpf_error("cid space grew past what was allocated: %u cids, %u cpu ids, sized for %u",
+			      nr_cids, nr_cpu_ids, nr_cids_max);
 		return -E2BIG;
 	}
 
@@ -853,15 +903,64 @@ void BPF_STRUCT_OPS(cidland_exit, struct scx_exit_info *ei)
  * allocator needs: it has to be ready before the first ops.init_task().
  */
 SEC("syscall")
-int cidland_arena_init(void *ctx)
+int cidland_arena_init(struct cidland_arena_args *args)
 {
+	u64 nr_cpus = args->nr_cpus, bytes;
+	u32 i;
 	s32 err;
 
-	err = scx_static_init(STATIC_ALLOC_PAGES);
+	if (!nr_cpus)
+		return -EINVAL;
+
+	nr_cids_max = nr_cpus;
+	nr_cid_words = div_round_up(nr_cpus, 64);
+
+	/*
+	 * The static allocator hands out of a pool it takes up front, so ask
+	 * for what the arrays below need plus a margin for the task context
+	 * allocator's own bookkeeping.
+	 */
+	bytes = nr_cpus * sizeof(struct cid_ctx) +
+		4 * (u64)nr_cid_words * sizeof(u64);
+	err = scx_static_init(div_round_up(bytes, PAGE_SIZE) + STATIC_ALLOC_PAGES);
 	if (err)
 		return err;
 
-	return scx_task_init(sizeof(struct task_ctx), SCX_CACHELINE_SIZE);
+	cid_ctxs = scx_static_alloc(nr_cpus * sizeof(struct cid_ctx), sizeof(u64));
+	all_cids = scx_static_alloc(nr_cid_words * sizeof(u64), sizeof(u64));
+	primary_cids = scx_static_alloc(nr_cid_words * sizeof(u64), sizeof(u64));
+	idle_cids = scx_static_alloc(nr_cid_words * sizeof(u64), sizeof(u64));
+	primary_cpus = scx_static_alloc(nr_cid_words * sizeof(u64), sizeof(u64));
+
+	if (!cid_ctxs || !all_cids || !primary_cids || !idle_cids || !primary_cpus)
+		return -ENOMEM;
+
+	/* @all_cids is the mask handed to the pick loop for unrestricted tasks. */
+	bpf_for(i, 0, nr_cid_words)
+		all_cids[i] = ~0ULL;
+
+	return scx_task_init(task_ctx_size(nr_cid_words), SCX_CACHELINE_SIZE);
+}
+
+/*
+ * Feed one word of the primary domain, in cpu space.
+ *
+ * Userspace calls this once per word after cidland_arena_init() and before
+ * attach; ops.init() translates the result to cid space.
+ */
+SEC("syscall")
+int cidland_set_primary_word(struct cidland_primary_args *args)
+{
+	u64 idx = args->idx;
+
+	TOUCH_ARENA();
+
+	if (!primary_cpus || idx >= nr_cid_words)
+		return -EINVAL;
+
+	primary_cpus[idx] = args->word;
+
+	return 0;
 }
 
 SCX_OPS_CID_DEFINE(cidland_ops,
