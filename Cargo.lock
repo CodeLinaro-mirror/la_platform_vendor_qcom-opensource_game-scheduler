@@ -5892,6 +5892,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "scx_bpf_abi"
+version = "1.1.4"
+
+[[package]]
 name = "scx_bpf_compat"
 version = "1.1.4"
 dependencies = [
