@@ -5915,6 +5915,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "scx_bpf_loader"
+version = "1.1.4"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "libbpf-rs 0.27.2",
+ "libc",
+ "log",
+ "scx_bpf_abi",
+ "scx_bpf_macros",
+ "scx_stats",
+ "scx_utils",
+ "serde",
+ "simplelog",
+]
+
+[[package]]
+name = "scx_bpf_macros"
+version = "1.1.4"
+
+[[package]]
 name = "scx_bpfland"
 version = "1.1.4"
 dependencies = [
