@@ -5896,6 +5896,13 @@ name = "scx_bpf_abi"
 version = "1.1.4"
 
 [[package]]
+name = "scx_bpf_build"
+version = "1.1.4"
+dependencies = [
+ "libbpf-rs 0.27.2",
+]
+
+[[package]]
 name = "scx_bpf_compat"
 version = "1.1.4"
 dependencies = [
