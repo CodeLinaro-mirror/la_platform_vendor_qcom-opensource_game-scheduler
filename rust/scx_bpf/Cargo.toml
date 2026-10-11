@@ -19,3 +19,4 @@ topo_size = []
 
 [dependencies]
 scx_bpf_abi = { path = "../scx_bpf_abi", version = "1.1.4" }
+scx_bpf_macros = { path = "../scx_bpf_macros", version = "1.1.4" }
